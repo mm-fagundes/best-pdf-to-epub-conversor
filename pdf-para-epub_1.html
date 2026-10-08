@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF → EPUB</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #f3f1ec; color: #222; display: flex; justify-content: center; padding: 32px 16px; }
+  .card { background: #fff; width: 100%; max-width: 520px; border-radius: 14px; padding: 28px; box-shadow: 0 4px 24px rgba(0,0,0,.08); }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  p.sub { margin: 0 0 20px; color: #777; font-size: 14px; }
+  .drop { border: 2px dashed #c9c3b6; border-radius: 10px; padding: 28px; text-align: center; cursor: pointer; transition: .15s; }
+  .drop:hover, .drop.over { border-color: #b5651d; background: #fdf8f2; }
+  .drop input { display: none; }
+  .row { display: flex; gap: 16px; margin-top: 20px; align-items: flex-start; }
+  #cover { width: 110px; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.2); display: none; }
+  .fields { flex: 1; display: flex; flex-direction: column; gap: 10px; }
+  label { font-size: 13px; color: #555; display: flex; flex-direction: column; gap: 4px; }
+  label.check { flex-direction: row; align-items: center; gap: 6px; }
+  input[type=text], select { padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+  button { margin-top: 20px; width: 100%; padding: 12px; font-size: 16px; border: 0; border-radius: 8px; background: #b5651d; color: #fff; cursor: pointer; }
+  button:disabled { background: #ccc; cursor: default; }
+  .bar { height: 6px; background: #eee; border-radius: 3px; margin-top: 14px; overflow: hidden; display: none; }
+  .bar div { height: 100%; width: 0; background: #b5651d; transition: width .2s; }
+  #status { font-size: 13px; color: #666; margin-top: 8px; min-height: 18px; }
+  #opts { display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>PDF → EPUB</h1>
+  <p class="sub">Tudo roda no seu navegador. Nada é enviado para servidor.</p>
+
+  <label class="drop" id="drop">
+    <input type="file" id="file" accept="application/pdf">
+    <strong>Clique ou arraste um PDF aqui</strong>
+    <div id="fname" style="font-size:13px;color:#888;margin-top:6px"></div>
+  </label>
+
+  <div id="opts">
+    <div class="row">
+      <img id="cover" alt="Capa">
+      <div class="fields">
+        <label>Título <input type="text" id="title"></label>
+        <label>Autor <input type="text" id="author"></label>
+        <label>Modo
+          <select id="mode">
+            <option value="text">Texto (ajusta à tela — livros)</option>
+            <option value="image">Imagens das páginas (HQs, PDFs escaneados)</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="skipFirst" checked> 1ª página é a capa (não repetir)</label>
+        <label class="check"><input type="checkbox" id="trim" checked> Cortar bordas brancas das imagens</label>
+      </div>
+    </div>
+    <button id="go">Converter e baixar EPUB</button>
+    <div class="bar" id="bar"><div></div></div>
+    <div id="status"></div>
+  </div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const $ = id => document.getElementById(id);
+let pdf = null, coverBlob = null, baseName = 'livro';
+const PAGES_PER_CHAPTER = 10;
+
+const esc = s => String(s)
+  .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function setProgress(p, msg) {
+  $('bar').style.display = 'block';
+  $('bar').firstElementChild.style.width = Math.round(p * 100) + '%';
+  if (msg) $('status').textContent = msg;
+}
+
+// Remove margens brancas: procura a primeira/última linha e coluna com "tinta"
+function trimCanvas(c) {
+  const w = c.width, h = c.height;
+  const d = c.getContext('2d').getImageData(0, 0, w, h).data;
+  const ink = i => d[i] < 220 || d[i+1] < 220 || d[i+2] < 220;
+  const NOISE = 0.005; // ignora sujeirinhas (até 0,5% de pixels escuros)
+  const rowHasInk = y => { let n = 0; for (let x = 0; x < w; x++) if (ink((y*w + x)*4) && ++n > w*NOISE) return true; return false; };
+  const colHasInk = (x, t, b) => { let n = 0; const lim = (b - t + 1)*NOISE; for (let y = t; y <= b; y++) if (ink((y*w + x)*4) && ++n > lim) return true; return false; };
+
+  let top = 0; while (top < h && !rowHasInk(top)) top++;
+  if (top >= h) return c; // página em branco
+  let bot = h - 1; while (bot > top && !rowHasInk(bot)) bot--;
+  let left = 0; while (left < w && !colHasInk(left, top, bot)) left++;
+  let right = w - 1; while (right > left && !colHasInk(right, top, bot)) right--;
+
+  const pad = Math.round(Math.min(w, h) * 0.015); // pequena folga
+  top = Math.max(0, top - pad); bot = Math.min(h - 1, bot + pad);
+  left = Math.max(0, left - pad); right = Math.min(w - 1, right + pad);
+  const cw = right - left + 1, chh = bot - top + 1;
+  if (cw > w * 0.97 && chh > h * 0.97) return c; // quase nada a cortar
+
+  const out = document.createElement('canvas');
+  out.width = cw; out.height = chh;
+  out.getContext('2d').drawImage(c, left, top, cw, chh, 0, 0, cw, chh);
+  return out;
+}
+
+async function renderPage(num, maxW, maxH) {
+  const page = await pdf.getPage(num);
+  const v1 = page.getViewport({ scale: 1 });
+  const scale = Math.min(maxW / v1.width, maxH / v1.height);
+  const vp = page.getViewport({ scale });
+  let c = document.createElement('canvas');
+  c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  if ($('trim').checked) c = trimCanvas(c);
+  return new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+}
+
+async function renderCover() {
+  coverBlob = await renderPage(1, 1200, 1800);
+  $('cover').src = URL.createObjectURL(coverBlob);
+  $('cover').style.display = 'block';
+}
+
+// Extrai texto de uma página e agrupa em parágrafos
+async function pageParagraphs(num) {
+  const page = await pdf.getPage(num);
+  const tc = await page.getTextContent();
+  const lines = []; let cur = null;
+  for (const it of tc.items) {
+    if (!('str' in it)) continue;
+    const y = it.transform[5];
+    const h = Math.abs(it.transform[3]) || it.height || 10;
+    if (it.str !== '') {
+      if (!cur || Math.abs(cur.y - y) > h * 0.5) { cur = { y, h, text: '' }; lines.push(cur); }
+      cur.text += it.str;
+    }
+    if (it.hasEOL) cur = null;
+  }
+  const clean = lines.map(l => ({ ...l, text: l.text.replace(/\s+/g, ' ').trim() })).filter(l => l.text);
+  if (!clean.length) return [];
+
+  const gaps = [];
+  for (let i = 1; i < clean.length; i++) { const g = clean[i-1].y - clean[i].y; if (g > 0) gaps.push(g); }
+  gaps.sort((a, b) => a - b);
+  const median = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+
+  const paras = []; let p = clean[0].text;
+  for (let i = 1; i < clean.length; i++) {
+    const gap = clean[i-1].y - clean[i].y;
+    const t = clean[i].text;
+    const newPara = gap <= 0 || (median && gap > median * 1.4) || /^[•\-–—]\s/.test(t);
+    if (newPara) { paras.push(p); p = t; }
+    else if (/[a-zà-ú]-$/i.test(p) && /^[a-zà-ú]/.test(t)) p = p.slice(0, -1) + t;
+    else p += ' ' + t;
+  }
+  paras.push(p);
+  return paras;
+}
+
+const xhtml = (title, body, lang) => `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="${lang}" xml:lang="${lang}">
+<head><meta charset="UTF-8"/><title>${esc(title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+${body}
+</body>
+</html>`;
+
+async function loadFile(file) {
+  if (!file || file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name)) { alert('Escolha um arquivo PDF.'); return; }
+  baseName = file.name.replace(/\.pdf$/i, '');
+  $('fname').textContent = file.name;
+  $('status').textContent = 'Lendo PDF...';
+  $('opts').style.display = 'block';
+  $('bar').style.display = 'none';
+  pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+
+  let info = {};
+  try { info = (await pdf.getMetadata()).info || {}; } catch (e) {}
+  $('title').value = (info.Title || '').trim() || baseName;
+  $('author').value = (info.Author || '').trim();
+
+  await renderCover();
+
+  // Sugere modo imagem se o PDF não tiver texto (escaneado)
+  const sample = await pageParagraphs(Math.min(pdf.numPages, 2));
+  $('mode').value = sample.length ? 'text' : 'image';
+  $('status').textContent = `${pdf.numPages} páginas.` + (sample.length ? '' : ' Sem texto detectado — modo imagem sugerido.');
+}
+
+async function convert() {
+  const title = $('title').value.trim() || baseName;
+  const author = $('author').value.trim() || 'Desconhecido';
+  const mode = $('mode').value;
+  const lang = 'pt-BR';
+  const start = $('skipFirst').checked ? 2 : 1;
+  const total = pdf.numPages;
+
+  $('go').disabled = true;
+  const zip = new JSZip();
+  zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+  zip.file('META-INF/container.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>`);
+
+  const O = zip.folder('OEBPS');
+  O.file('style.css', `body{margin:0 5%;font-family:serif;line-height:1.5}
+p{text-indent:1.2em;margin:0 0 .4em;text-align:justify}
+h2{font-size:1em;color:#888;text-align:center;margin:1.5em 0}
+.cover,.pg{margin:0;padding:0;text-align:center}
+.cover img,.pg img{max-width:100%;max-height:100vh}`);
+  O.file('cover.jpg', coverBlob);
+  O.file('cover.xhtml', xhtml('Capa', `<div class="cover"><img src="cover.jpg" alt="${esc(title)}"/></div>`, lang));
+
+  const manifest = [], spine = [], toc = [];
+
+  if (mode === 'image') {
+    for (let n = start; n <= total; n++) {
+      setProgress((n - start) / (total - start + 1), `Renderizando página ${n} de ${total}...`);
+      const id = 'p' + n;
+      O.file(`img/${id}.jpg`, await renderPage(n, 1200, 1800));
+      O.file(`${id}.xhtml`, xhtml(`Página ${n}`, `<div class="pg"><img src="img/${id}.jpg" alt="Página ${n}"/></div>`, lang));
+      manifest.push(`<item id="img-${id}" href="img/${id}.jpg" media-type="image/jpeg"/>`);
+      manifest.push(`<item id="${id}" href="${id}.xhtml" media-type="application/xhtml+xml"/>`);
+      spine.push(`<itemref idref="${id}"/>`);
+      if ((n - start) % PAGES_PER_CHAPTER === 0) toc.push({ href: `${id}.xhtml`, label: `Página ${n}` });
+    }
+  } else {
+    let ch = 0;
+    for (let s = start; s <= total; s += PAGES_PER_CHAPTER) {
+      const e = Math.min(s + PAGES_PER_CHAPTER - 1, total);
+      let body = '';
+      for (let n = s; n <= e; n++) {
+        setProgress((n - start) / (total - start + 1), `Extraindo texto da página ${n} de ${total}...`);
+        const paras = await pageParagraphs(n);
+        body += paras.map(p => `<p>${esc(p)}</p>`).join('\n') + '\n';
+      }
+      ch++;
+      const id = 'c' + ch, label = s === e ? `Página ${s}` : `Páginas ${s}–${e}`;
+      O.file(`${id}.xhtml`, xhtml(label, body || '<p></p>', lang));
+      manifest.push(`<item id="${id}" href="${id}.xhtml" media-type="application/xhtml+xml"/>`);
+      spine.push(`<itemref idref="${id}"/>`);
+      toc.push({ href: `${id}.xhtml`, label });
+    }
+  }
+
+  O.file('nav.xhtml', xhtml('Sumário', `<nav epub:type="toc" id="toc"><h1>Sumário</h1><ol>
+<li><a href="cover.xhtml">Capa</a></li>
+${toc.map(t => `<li><a href="${t.href}">${esc(t.label)}</a></li>`).join('\n')}
+</ol></nav>`, lang));
+
+  const uid = 'urn:uuid:' + (crypto.randomUUID ? crypto.randomUUID() : Date.now());
+  O.file('toc.ncx', `<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head><meta name="dtb:uid" content="${uid}"/></head>
+<docTitle><text>${esc(title)}</text></docTitle>
+<navMap>
+<navPoint id="n0" playOrder="1"><navLabel><text>Capa</text></navLabel><content src="cover.xhtml"/></navPoint>
+${toc.map((t, i) => `<navPoint id="n${i+1}" playOrder="${i+2}"><navLabel><text>${esc(t.label)}</text></navLabel><content src="${t.href}"/></navPoint>`).join('\n')}
+</navMap>
+</ncx>`);
+
+  const modified = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+  O.file('content.opf', `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:identifier id="uid">${uid}</dc:identifier>
+  <dc:title>${esc(title)}</dc:title>
+  <dc:creator>${esc(author)}</dc:creator>
+  <dc:language>${lang}</dc:language>
+  <meta property="dcterms:modified">${modified}</meta>
+  <meta name="cover" content="cover-img"/>
+</metadata>
+<manifest>
+  <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+  <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+  <item id="css" href="style.css" media-type="text/css"/>
+  <item id="cover-img" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/>
+  <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
+  ${manifest.join('\n  ')}
+</manifest>
+<spine toc="ncx">
+  <itemref idref="cover"/>
+  ${spine.join('\n  ')}
+</spine>
+<guide><reference type="cover" title="Capa" href="cover.xhtml"/></guide>
+</package>`);
+
+  setProgress(1, 'Gerando arquivo...');
+  const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/epub+zip', compression: 'DEFLATE' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (title.replace(/[\\/:*?"<>|]/g, '').trim() || baseName) + '.epub';
+  a.click();
+  $('status').textContent = 'Pronto! EPUB baixado.';
+  $('go').disabled = false;
+}
+
+$('file').addEventListener('change', e => loadFile(e.target.files[0]).catch(err => $('status').textContent = 'Erro: ' + err.message));
+const drop = $('drop');
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); loadFile(e.dataTransfer.files[0]).catch(err => $('status').textContent = 'Erro: ' + err.message); });
+$('trim').addEventListener('change', () => { if (pdf) renderCover(); });
+$('go').addEventListener('click', () => convert().catch(err => { $('status').textContent = 'Erro: ' + err.message; $('go').disabled = false; }));
+</script>
+</body>
+</html>
