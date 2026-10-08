@@ -27,6 +27,8 @@
   .bar div { height: 100%; width: 0; background: #b5651d; transition: width .2s; }
   #status { font-size: 13px; color: #666; margin-top: 8px; min-height: 18px; }
   #opts { display: none; }
+  #kindle { display: none; margin-top: 12px; padding: 10px; text-align: center; border-radius: 8px; background: #fdf8f2; border: 1px solid #e8d6c2; color: #b5651d; font-weight: 600; text-decoration: none; }
+  #kindle:hover { background: #f9eedf; }
 </style>
 </head>
 <body>
@@ -59,6 +61,7 @@
     <button id="go">Converter e baixar EPUB</button>
     <div class="bar" id="bar"><div></div></div>
     <div id="status"></div>
+    <a id="kindle" href="https://www.amazon.com/sendtokindle" target="_blank" rel="noopener">E clique aqui para enviar seu EPUB para o Kindle</a>
   </div>
 </div>
 
@@ -178,6 +181,7 @@ async function loadFile(file) {
   $('status').textContent = 'Lendo PDF...';
   $('opts').style.display = 'block';
   $('bar').style.display = 'none';
+  $('kindle').style.display = 'none';
   pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
 
   let info = {};
@@ -299,6 +303,7 @@ ${toc.map((t, i) => `<navPoint id="n${i+1}" playOrder="${i+2}"><navLabel><text>$
   a.download = (title.replace(/[\\/:*?"<>|]/g, '').trim() || baseName) + '.epub';
   a.click();
   $('status').textContent = 'Pronto! EPUB baixado.';
+  $('kindle').style.display = 'block';
   $('go').disabled = false;
 }
 
